@@ -1,4 +1,4 @@
-name: ModelOps Deploy
+name: ModelOps2 Deploy
 
 on:
   push:
