@@ -1,0 +1,139 @@
+name: ModelOps Deploy
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  repository_dispatch:
+    types: [ ml_ci_cd ]
+
+jobs:
+  ml_ci_cd:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8']
+
+    # Todo se ejecuta dentro de deploy/ (donde está tu Dockerfile)
+    defaults:
+      run:
+        shell: bash
+        working-directory: ./deploy
+
+    env:
+      IMAGE_NAME: fastapiml   # cambia el nombre si quieres
+
+    steps:
+      # 1) Checkout
+      - uses: actions/checkout@v4
+
+      # 2) Python 3.8
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix['python-version'] }}
+
+      # 3) Mostrar versiones
+      - name: Show Python & pip
+        run: |
+          python --version
+          python -m pip --version
+
+      # 4) Evitar conflictos en Py3.8
+      - name: Upgrade pip/setuptools/wheel (Py3.8-safe)
+        run: |
+          python -m pip install --upgrade "pip<25" "setuptools<70" "wheel"
+
+      # 5) Cache de pip
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-py38-pip-${{ hashFiles('deploy/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-py38-pip-
+
+      # 6) Instalar dependencias
+      - name: Install requirements
+        run: python -m pip install -r requirements.txt
+
+      # 7) (Opcional) Descargar dataset si llega por repository_dispatch
+      - name: Download dataset (repository_dispatch)
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.dataseturl != '' }}
+        run: |
+          mkdir -p data
+          wget -O data/Arsenal.csv "${{ github.event.client_payload.dataseturl }}"
+
+      # 8) Mostrar preview del dataset si existe
+      - name: Preview dataset if present
+        run: |
+          if [ -f data/Arsenal.csv ]; then
+            echo "===== head -n 5 data/Arsenal.csv ====="
+            head -n 5 data/Arsenal.csv
+          else
+            echo "data/Arsenal.csv not found; proceeding anyway."
+          fi
+
+      # 9) Entrenar modelo
+      - name: Train model
+        run: python model/train.py
+
+      # 10) Listar carpeta model
+      - name: List model dir
+        run: |
+          if [ -d model ]; then
+            ls -la model
+          else
+            echo "Directory 'model' does not exist."
+          fi
+
+      # 11) Subir artefactos (mi_modelo.joblib y features.json)
+      - name: Upload model artifacts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: |
+            model/mi_modelo.joblib
+            model/features.json
+
+      # 12) Calcular TAG (usa client_payload.sha si viene; si no, el commit SHA)
+      - name: Compute image tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.client_payload.sha }}" ]; then
+            echo "tag=${{ github.event.client_payload.sha }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          fi
+          echo "TAG=${{ steps.tag.outputs.tag }}"
+
+      # 13) Login en Docker Hub
+      - name: Docker login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # 14) Build (contexto = deploy/) y tag con SHA
+      - name: Docker build
+        run: |
+          docker build -t "${{ secrets.DOCKER_USER }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}" .
+
+      # 15) Mostrar imágenes
+      - name: Show docker images
+        run: docker images | head -n 20
+
+      # 16) Push con el tag SHA
+      - name: Docker push (SHA tag)
+        run: |
+          docker push "${{ secrets.DOCKER_USER }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}"
+
+      # 17) (Opcional) Tag y push "latest" si es push directo a master/main
+      - name: Docker tag+push latest (only on push to default branch)
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') }}
+        run: |
+          docker tag "${{ secrets.DOCKER_USER }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}" \
+                     "${{ secrets.DOCKER_USER }}/${{ env.IMAGE_NAME }}:latest"
+          docker push "${{ secrets.DOCKER_USER }}/${{ env.IMAGE_NAME }}:latest"
